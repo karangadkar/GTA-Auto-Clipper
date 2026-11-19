@@ -1,0 +1,95 @@
+name: Shorts analysis and render
+run-name: Shorts ${{ inputs.mode }} - ${{ github.run_number }}
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Analyze footage or render three reviewed edits
+        type: choice
+        options: [analyze, render]
+        default: analyze
+        required: true
+      source_url:
+        description: Public source video URL
+        type: string
+        required: true
+      window_start:
+        description: Absolute source start in seconds; -1 selects the latest completed 15 minutes
+        type: string
+        default: '-1'
+      analysis_run_id:
+        description: Analysis workflow run ID, required for rendering
+        type: string
+        default: ''
+      edit_json:
+        description: Reviewed titles, exact cuts, Roman-Hindi captions and facecam positions
+        type: string
+        default: '{}'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  shorts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: '1'
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '1'
+      SOURCE_URL: ${{ inputs.source_url }}
+      WINDOW_START: ${{ inputs.window_start }}
+      EDIT_JSON: ${{ inputs.edit_json }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install free media tools
+        run: |
+          python -m pip install --disable-pip-version-check 'yt-dlp[default]' requests
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y ffmpeg fonts-dejavu-core
+          fi
+          ffmpeg -version | head -n 1
+          node --version
+      - name: Check source availability before heavy setup
+        if: inputs.mode == 'analyze'
+        run: python tools/shorts_render.py probe --url "$SOURCE_URL" --work work
+      - name: Install CPU transcription and image packages
+        run: |
+          python -m pip install --disable-pip-version-check 'numpy<3' Pillow 'opencv-python-headless>=4.10,<5' 'faster-whisper==1.2.1' 'av>=14,<16' chat-downloader
+      - name: Analyze fixed source window and viewer reactions
+        if: inputs.mode == 'analyze'
+        run: python tools/shorts_render.py analyze --url "$SOURCE_URL" --start "$WINDOW_START" --work work
+      - name: Restore reviewed analysis assets
+        if: inputs.mode == 'render'
+        uses: actions/download-artifact@v4
+        with:
+          name: shorts-analysis-${{ inputs.analysis_run_id }}
+          run-id: ${{ inputs.analysis_run_id }}
+          github-token: ${{ github.token }}
+          path: work/restored
+      - name: Render reviewed Shorts and validate exports
+        if: inputs.mode == 'render'
+        run: python tools/shorts_render.py render --url "$SOURCE_URL" --work work
+      - name: Save analysis and diagnostic files
+        if: always() && inputs.mode == 'analyze'
+        uses: actions/upload-artifact@v4
+        with:
+          name: shorts-analysis-${{ github.run_id }}
+          path: work/artifacts/
+          retention-days: 1
+          if-no-files-found: warn
+          compression-level: 0
+      - name: Save finished MP4s and ZIP
+        if: success() && inputs.mode == 'render'
+        uses: actions/upload-artifact@v4
+        with:
+          name: completed-shorts-${{ github.run_id }}
+          path: work/exports/
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
