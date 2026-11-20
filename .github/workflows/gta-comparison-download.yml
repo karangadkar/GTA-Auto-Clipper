@@ -1,0 +1,126 @@
+name: GTA comparison - source download
+run-name: Download GTA comparison ${{ inputs.video_id }} - ${{ github.run_number }}
+
+'on':
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: YouTube video ID to download for comparison editing
+        required: true
+        default: uBGfkHIwTiU
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      VIDEO_ID: ${{ inputs.video_id }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Validate the requested video ID
+        run: |
+          mkdir -p downloads diagnostics analysis
+          python3 - <<'PY'
+          import os, re
+          if not re.fullmatch(r'[A-Za-z0-9_-]{11}', os.environ['VIDEO_ID']):
+              raise SystemExit('A valid 11-character YouTube video ID is required.')
+          PY
+
+      - name: Check out the owned downloader fork at a fixed commit
+        uses: actions/checkout@v4
+        with:
+          repository: karangadkar/yt-dlp
+          ref: 2d596f4882a2d6e6414836bccd9fd3fb1e1534a2
+          path: downloader
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Prepare downloader and standard media tools
+        run: |
+          python -m pip install --disable-pip-version-check './downloader[default,curl-cffi]'
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y ffmpeg fonts-dejavu-core
+          fi
+          yt-dlp --version
+          ffmpeg -version | head -n 1
+
+      - name: Download the source without cookies or publishing
+        run: |
+          set -euo pipefail
+          yt-dlp --ignore-config --no-playlist --newline \
+            --socket-timeout 30 --retries 3 --fragment-retries 3 \
+            --concurrent-fragments 4 --js-runtimes deno \
+            --format 'bv*[height<=1080]+ba/b[height<=1080]/b' \
+            --merge-output-format mp4 --remux-video mp4 \
+            --write-info-json \
+            --output 'downloads/source.%(ext)s' \
+            -- "https://www.youtube.com/watch?v=${VIDEO_ID}" \
+            2>&1 | tee diagnostics/download.log
+
+      - name: Verify the downloaded video and save editing metadata
+        run: |
+          test -s downloads/source.mp4
+          ffprobe -v error -show_streams -show_format -of json downloads/source.mp4 > downloads/media-probe.json
+          sha256sum downloads/source.mp4 > downloads/SHA256SUMS
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          info = json.loads(Path('downloads/source.info.json').read_text())
+          fields = ('id', 'title', 'webpage_url', 'channel', 'channel_id', 'duration',
+                    'upload_date', 'chapters', 'width', 'height', 'fps', 'vcodec', 'acodec')
+          summary = {key: info.get(key) for key in fields}
+          summary['downloader_fork'] = 'karangadkar/yt-dlp'
+          summary['downloader_commit'] = '2d596f4882a2d6e6414836bccd9fd3fb1e1534a2'
+          Path('downloads/source-metadata.json').write_text(json.dumps(summary, indent=2))
+          probe = json.loads(Path('downloads/media-probe.json').read_text())
+          videos = [s for s in probe['streams'] if s.get('codec_type') == 'video']
+          if not videos or float(probe['format'].get('duration', 0)) < 20:
+              raise SystemExit('Downloaded file did not pass video verification.')
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Generate timestamped overview sheets for comparison analysis
+        continue-on-error: true
+        run: |
+          ffmpeg -hide_banner -loglevel error -i downloads/source.mp4 \
+            -vf "fps=1/8,scale=384:-2,drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:text='%{pts\:hms}':x=8:y=8:fontsize=19:fontcolor=white:box=1:boxcolor=black@0.7,tile=5x5:padding=6:margin=6:color=black" \
+            -q:v 3 -fps_mode vfr analysis/overview-%02d.jpg
+
+      - name: Save the verified source as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta-comparison-source-${{ github.run_id }}
+          path: |
+            downloads/source.mp4
+            downloads/source-metadata.json
+            downloads/media-probe.json
+            downloads/SHA256SUMS
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Save analysis sheets and download diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta-comparison-analysis-${{ github.run_id }}
+          path: |
+            analysis/
+            diagnostics/
+            downloads/source-metadata.json
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: warn
